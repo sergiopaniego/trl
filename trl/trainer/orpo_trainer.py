@@ -20,6 +20,7 @@ import warnings
 from collections import defaultdict
 from contextlib import nullcontext
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Any, Callable, Literal, Optional, Union
 
 import numpy as np
@@ -45,10 +46,12 @@ from transformers import (
     is_torch_xla_available,
     is_wandb_available,
 )
+from transformers.data.data_collator import DataCollatorMixin
 from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_utils import EvalLoopOutput
 from transformers.utils import is_peft_available, is_torch_fx_proxy
 from transformers.utils.deprecation import deprecate_kwarg
+from transformers.models.auto.modeling_auto import MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES
 
 from ..data_utils import maybe_apply_chat_template, maybe_extract_prompt
 from ..models import PreTrainedModelWrapper
@@ -60,6 +63,7 @@ from .utils import (
     disable_dropout_in_model,
     generate_model_card,
     get_comet_experiment_url,
+    pad,
     pad_to_length,
     peft_module_casting_to_bf16,
 )
@@ -77,6 +81,83 @@ if is_deepspeed_available():
 
 if is_torch_xla_available():
     import torch_xla.core.xla_model as xm
+
+
+@dataclass
+class PreferenceCollator(DataCollatorMixin):
+    """
+    Data collator used for preference data. Inputs are dynamically padded to the maximum length of a batch if they
+    are not all of the same length.
+
+    Args:
+        pad_token_id (`int`):
+            Token ID to use for padding.
+        return_tensors (`str`, *optional*, defaults to `"pt"`):
+            Type of Tensor to return. Only `"pt"` is currently supported.
+
+    Examples:
+    ```python
+    >>> from trl import PreferenceCollator
+    >>> collator = PreferenceCollator(pad_token_id=0)
+    >>> examples = [
+    ...     {"prompt_input_ids": [1, 2, 3], "chosen_input_ids": [4, 5], "rejected_input_ids": [6]},
+    ...     {"prompt_input_ids": [7, 8], "chosen_input_ids": [9, 10], "rejected_input_ids": [11, 12, 13]}
+    ... ]
+    >>> collator(examples)
+    {'prompt_input_ids': tensor([[1, 2, 3],
+                                 [0, 7, 8]]),
+     'prompt_attention_mask': tensor([[1, 1, 1],
+                                      [0, 1, 1]]),
+     'chosen_input_ids': tensor([[ 4,  5],
+                                 [ 9, 10]]),
+     'chosen_attention_mask': tensor([[1, 1],
+                                      [1, 1]]),
+     'rejected_input_ids': tensor([[ 6,  0,  0],
+                                   [11, 12, 13]]),
+     'rejected_attention_mask': tensor([[1, 0, 0],
+                                        [1, 1, 1]])
+    }
+    ```
+    """
+
+    pad_token_id: int
+    return_tensors: str = "pt"
+
+    def torch_call(self, examples: list[Union[list[int], Any, dict[str, Any]]]) -> dict[str, Any]:
+        # Convert to tensor
+        prompt_input_ids = [torch.tensor(example["prompt_input_ids"]) for example in examples]
+        prompt_attention_mask = [torch.ones_like(input_ids) for input_ids in prompt_input_ids]
+        chosen_input_ids = [torch.tensor(example["chosen_input_ids"]) for example in examples]
+        chosen_attention_mask = [torch.ones_like(input_ids) for input_ids in chosen_input_ids]
+        rejected_input_ids = [torch.tensor(example["rejected_input_ids"]) for example in examples]
+        rejected_attention_mask = [torch.ones_like(input_ids) for input_ids in rejected_input_ids]
+        if "pixel_values" in examples[0]:
+            pixel_values = [torch.tensor(example["pixel_values"]) for example in examples]
+        if "pixel_attention_mask" in examples[0]:
+            pixel_attention_mask = [torch.tensor(example["pixel_attention_mask"]) for example in examples]
+        if "ref_chosen_logps" in examples[0] and "ref_rejected_logps" in examples[0]:
+            ref_chosen_logps = torch.tensor([example["ref_chosen_logps"] for example in examples])
+            ref_rejected_logps = torch.tensor([example["ref_rejected_logps"] for example in examples])
+
+        # Pad
+        output = {}
+        output["prompt_input_ids"] = pad(prompt_input_ids, padding_value=self.pad_token_id, padding_side="left")
+        output["prompt_attention_mask"] = pad(prompt_attention_mask, padding_value=0, padding_side="left")
+        output["chosen_input_ids"] = pad(chosen_input_ids, padding_value=self.pad_token_id)
+        output["chosen_attention_mask"] = pad(chosen_attention_mask, padding_value=0)
+        output["rejected_input_ids"] = pad(rejected_input_ids, padding_value=self.pad_token_id)
+        output["rejected_attention_mask"] = pad(rejected_attention_mask, padding_value=0)
+        if "pixel_values" in examples[0]:
+            output["pixel_values"] = pad(pixel_values, padding_value=0.0)
+        if "pixel_attention_mask" in examples[0]:
+            output["pixel_attention_mask"] = pad(pixel_attention_mask, padding_value=0)
+        if "image_sizes" in examples[0]:
+            output["image_sizes"] = torch.tensor([example["image_sizes"] for example in examples])
+        if "ref_chosen_logps" in examples[0] and "ref_rejected_logps" in examples[0]:
+            output["ref_chosen_logps"] = ref_chosen_logps
+            output["ref_rejected_logps"] = ref_rejected_logps
+
+        return output
 
 
 class ORPOTrainer(Trainer):
@@ -231,6 +312,8 @@ class ORPOTrainer(Trainer):
             self.decoder_start_token_id = model.config.decoder_start_token_id
             self.pad_token_id = model.config.pad_token_id
 
+        self.is_vision_model = model.config.model_type in MODEL_FOR_VISION_2_SEQ_MAPPING_NAMES.keys()
+
         if processing_class is None:
             raise ValueError("processing_class must be specified to tokenize a ORPO dataset.")
         if args.max_length is None:
@@ -262,13 +345,29 @@ class ORPOTrainer(Trainer):
         else:
             self.max_completion_length = args.max_completion_length
 
+        if args.padding_value is not None:
+            self.padding_value = args.padding_value
+        else:
+            if hasattr(processing_class, "pad_token_id") and processing_class.pad_token_id is not None:
+                self.padding_value = processing_class.pad_token_id
+            elif hasattr(processing_class, "tokenizer") and processing_class.tokenizer.pad_token_id is not None:
+                self.padding_value = processing_class.tokenizer.pad_token_id
+            else:
+                raise ValueError(
+                    "Can't find `pad_token_id` in the `processing_class`. "
+                    "Explicitly set `tokenizer.pad_token` (e.g. `tokenizer.pad_token = tokenizer.eos_token`) "
+                    "before instantiating the trainer."
+                )
+
         if data_collator is None:
+            data_collator = PreferenceCollator(pad_token_id=self.padding_value)
+            '''
             data_collator = DPODataCollatorWithPadding(
                 pad_token_id=processing_class.pad_token_id,
                 label_pad_token_id=args.label_pad_token_id,
                 is_encoder_decoder=self.is_encoder_decoder,
             )
-
+            '''
             if args.remove_unused_columns:
                 args.remove_unused_columns = False
                 # warn users
@@ -288,7 +387,6 @@ class ORPOTrainer(Trainer):
         self.max_length = max_length
         self.generate_during_eval = args.generate_during_eval
         self.label_pad_token_id = args.label_pad_token_id
-        self.padding_value = args.padding_value if args.padding_value is not None else processing_class.pad_token_id
         self.max_prompt_length = max_prompt_length
         self.truncation_mode = args.truncation_mode
         self.processing_class = processing_class
@@ -306,6 +404,7 @@ class ORPOTrainer(Trainer):
             )
 
         self._stored_metrics = defaultdict(lambda: defaultdict(list))
+        self.dataset_num_proc = args.dataset_num_proc
 
         # The trainer estimates the number of FLOPs (floating-point operations) using the number of elements in the
         # input tensor associated with the key "input_ids". However, in ORPO, the sampled data does not include the
@@ -319,20 +418,49 @@ class ORPOTrainer(Trainer):
         # Compute that only on the main process for faster data processing.
         # see: https://github.com/huggingface/trl/pull/1255
         with PartialState().local_main_process_first():
-            # Extract the prompt if needed, and apply the chat template if needed
-            train_dataset = train_dataset.map(maybe_extract_prompt, num_proc=args.dataset_num_proc)
             train_dataset = train_dataset.map(
-                maybe_apply_chat_template, fn_kwargs={"tokenizer": processing_class}, num_proc=args.dataset_num_proc
+                maybe_extract_prompt, num_proc=args.dataset_num_proc, desc="Extracting prompt from train dataset"
             )
-            train_dataset = train_dataset.map(self.tokenize_row, num_proc=args.dataset_num_proc)
+            train_dataset = train_dataset.map(
+                maybe_apply_chat_template,
+                fn_kwargs={"tokenizer": processing_class},
+                num_proc=args.dataset_num_proc,
+                desc="Applying chat template to train dataset",
+            )
             if eval_dataset is not None:
-                eval_dataset = eval_dataset.map(maybe_extract_prompt, num_proc=args.dataset_num_proc)
+                eval_dataset = eval_dataset.map(
+                    maybe_extract_prompt, num_proc=args.dataset_num_proc, desc="Extracting prompt from eval dataset"
+                )
                 eval_dataset = eval_dataset.map(
                     maybe_apply_chat_template,
                     fn_kwargs={"tokenizer": processing_class},
                     num_proc=args.dataset_num_proc,
+                    desc="Applying chat template to eval dataset",
                 )
-                eval_dataset = eval_dataset.map(self.tokenize_row, num_proc=args.dataset_num_proc)
+
+            # tokenize the dataset, lower writer batch size to avoid OOM (frequent in vision models)
+            fn_kwargs = {
+                "processing_class": processing_class,
+                "max_prompt_length": args.max_prompt_length,
+                "max_completion_length": args.max_completion_length,
+                # for enc-dec, we add the special tokens ([bos_token] + prompt + [eos_token]; completion + [eos_token])
+                "add_special_tokens": self.is_encoder_decoder,
+            }
+            train_dataset = train_dataset.map(
+                self.tokenize_row if not self.is_vision_model else self.process_row,
+                fn_kwargs=fn_kwargs,
+                num_proc=self.dataset_num_proc,
+                writer_batch_size=10,
+                desc="Tokenizing train dataset",
+            )
+            if eval_dataset is not None:
+                eval_dataset = eval_dataset.map(
+                    self.tokenize_row if not self.is_vision_model else self.process_row,
+                    fn_kwargs=fn_kwargs,
+                    num_proc=self.dataset_num_proc,
+                    writer_batch_size=10,
+                    desc="Tokenizing eval dataset",
+                )
 
         super().__init__(
             model=model,
@@ -593,6 +721,49 @@ class ORPOTrainer(Trainer):
                     pad_value = 0
                 batch[k] = batch[k] + [pad_value] * (self.max_length - len(batch[k]))
         return batch
+    
+    @staticmethod
+    def process_row(features, processing_class, max_prompt_length, max_completion_length, add_special_tokens):
+        """
+        Same as `tokenize_row` but for vision models. Please refer to `tokenize_row` for more information.
+        """
+        processor, tokenizer = processing_class, processing_class.tokenizer  # the processing class is a processor
+        processed_features = processor(images=features["images"], text=features["prompt"], add_special_tokens=False)
+
+        prompt_input_ids = processed_features["input_ids"][0]
+        pixel_values = processed_features["pixel_values"][0]
+        chosen_input_ids = tokenizer(features["chosen"], add_special_tokens=False)["input_ids"]
+        rejected_input_ids = tokenizer(features["rejected"], add_special_tokens=False)["input_ids"]
+
+        # Add special tokens (typically for encoder-decoder models)
+        if add_special_tokens:
+            if tokenizer.bos_token_id is not None:
+                prompt_input_ids = [tokenizer.bos_token_id] + prompt_input_ids
+            if tokenizer.eos_token_id is not None:
+                prompt_input_ids = prompt_input_ids + [tokenizer.eos_token_id]
+        chosen_input_ids = chosen_input_ids + [tokenizer.eos_token_id]
+        rejected_input_ids = rejected_input_ids + [tokenizer.eos_token_id]
+
+        # Truncate prompt and completion sequences
+        if max_prompt_length is not None:
+            prompt_input_ids = prompt_input_ids[-max_prompt_length:]
+        if max_completion_length is not None:
+            chosen_input_ids = chosen_input_ids[:max_completion_length]
+            rejected_input_ids = rejected_input_ids[:max_completion_length]
+
+        output = {
+            "prompt_input_ids": prompt_input_ids,
+            "pixel_values": pixel_values,
+            "chosen_input_ids": chosen_input_ids,
+            "rejected_input_ids": rejected_input_ids,
+        }
+
+        if "pixel_attention_mask" in processed_features:
+            output["pixel_attention_mask"] = processed_features["pixel_attention_mask"][0]
+        if "image_sizes" in processed_features:
+            output["image_sizes"] = processed_features["image_sizes"][0]
+
+        return output
 
     @staticmethod
     def concatenated_inputs(
@@ -614,6 +785,40 @@ class ORPOTrainer(Trainer):
         Returns:
             A dictionary containing the concatenated inputs under the key 'concatenated_input_ids'.
         """
+        output = {}
+
+        # For the prompt, the input_ids are the same for both the chosen and rejected responses
+        output["prompt_input_ids"] = torch.cat([batch["prompt_input_ids"], batch["prompt_input_ids"]], dim=0)
+        output["prompt_attention_mask"] = torch.cat(
+            [batch["prompt_attention_mask"], batch["prompt_attention_mask"]], dim=0
+        )
+        if "pixel_values" in batch:
+            output["pixel_values"] = torch.cat([batch["pixel_values"], batch["pixel_values"]], dim=0)
+
+        if "pixel_attention_mask" in batch:
+            output["pixel_attention_mask"] = torch.cat(
+                [batch["pixel_attention_mask"], batch["pixel_attention_mask"]], dim=0
+            )
+        if "image_sizes" in batch:
+            output["image_sizes"] = torch.cat([batch["image_sizes"], batch["image_sizes"]], dim=0)
+
+        # Concatenate the chosen and rejected completions
+        max_completion_length = max(batch["chosen_input_ids"].shape[1], batch["rejected_input_ids"].shape[1])
+        output["completion_input_ids"] = torch.cat(
+            (
+                pad_to_length(batch["chosen_input_ids"], max_completion_length, pad_value=padding_value),
+                pad_to_length(batch["rejected_input_ids"], max_completion_length, pad_value=padding_value),
+            ),
+        )
+        output["completion_attention_mask"] = torch.cat(
+            (
+                pad_to_length(batch["chosen_attention_mask"], max_completion_length, pad_value=0),
+                pad_to_length(batch["rejected_attention_mask"], max_completion_length, pad_value=0),
+            ),
+        )
+
+        return output
+        '''
         concatenated_batch = {}
 
         if is_encoder_decoder:
@@ -655,6 +860,7 @@ class ORPOTrainer(Trainer):
             )
 
         return concatenated_batch
+        '''
 
     def odds_ratio_loss(
         self,
@@ -739,7 +945,8 @@ class ORPOTrainer(Trainer):
             padding_value=self.padding_value,
             device=self.accelerator.device,
         )
-        len_chosen = batch["chosen_labels"].shape[0]
+        print(concatenated_batch)
+        #len_chosen = batch["chosen_labels"].shape[0]
 
         model_kwargs = (
             {
@@ -752,13 +959,88 @@ class ORPOTrainer(Trainer):
         if self.aux_loss_enabled:
             model_kwargs["output_router_logits"] = True
 
-        outputs = model(
-            concatenated_batch["concatenated_input_ids"],
-            attention_mask=concatenated_batch["concatenated_attention_mask"],
-            use_cache=False,
-            **model_kwargs,
-        )
-        all_logits = outputs.logits
+         # Add the pixel values and attention masks for vision models
+        if "pixel_values" in concatenated_batch:
+            model_kwargs["pixel_values"] = concatenated_batch["pixel_values"]
+        if "pixel_attention_mask" in concatenated_batch:
+            model_kwargs["pixel_attention_mask"] = concatenated_batch["pixel_attention_mask"]
+        if "image_sizes" in concatenated_batch:
+            model_kwargs["image_sizes"] = concatenated_batch["image_sizes"]
+
+        if self.is_encoder_decoder:
+            len_chosen = batch["chosen_labels"].shape[0]
+            outputs = model(
+                concatenated_batch["concatenated_input_ids"],
+                attention_mask=concatenated_batch["concatenated_attention_mask"],
+                use_cache=False,
+                **model_kwargs,
+            )
+            all_logits = outputs.logits
+            labels = concatenated_batch["concatenated_labels"].clone()
+        else:
+            prompt_input_ids = concatenated_batch["prompt_input_ids"]
+            prompt_attention_mask = concatenated_batch["prompt_attention_mask"]
+            completion_input_ids = concatenated_batch["completion_input_ids"]
+            completion_attention_mask = concatenated_batch["completion_attention_mask"]
+            # Concatenate the prompt and completion inputs
+            input_ids = torch.cat((prompt_input_ids, completion_input_ids), dim=1)
+            attention_mask = torch.cat((prompt_attention_mask, completion_attention_mask), dim=1)
+            # Mask the prompt but not the completion for the loss
+            loss_mask = torch.cat(
+                (torch.zeros_like(prompt_attention_mask), completion_attention_mask),
+                dim=1,
+            )
+
+            # Flush left to reduce the memory usage
+            # [[0, 0, x, x, x, x],  ->  [[x, x, x, x],
+            #  [0, x, x, x, 0, 0]]       [x, x, x, 0]]
+            for i in range(attention_mask.size(0)):
+                first_one_idx = torch.nonzero(attention_mask[i])[0].item()
+                input_ids[i] = torch.roll(input_ids[i], shifts=-first_one_idx)
+                attention_mask[i] = torch.roll(attention_mask[i], shifts=-first_one_idx)
+                loss_mask[i] = torch.roll(loss_mask[i], shifts=-first_one_idx)
+
+            # Get the first column idx that is all zeros and remove every column after that
+            empty_cols = torch.sum(attention_mask, dim=0) == 0
+            first_empty_col = torch.nonzero(empty_cols)[0].item() if empty_cols.any() else attention_mask.size(1)
+            input_ids = input_ids[:, :first_empty_col]
+            attention_mask = attention_mask[:, :first_empty_col]
+            loss_mask = loss_mask[:, :first_empty_col]
+
+            # Truncate right
+            if self.args.max_length is not None:
+                input_ids = input_ids[:, : self.args.max_length]
+                attention_mask = attention_mask[:, : self.args.max_length]
+                loss_mask = loss_mask[:, : self.args.max_length]
+
+            '''
+            if self.use_num_logits_to_keep:
+                # Compute num_logits_to_keep based on loss_mask pattern:
+                # [[0, 0, 0, x, x, x, x],
+                #  [0, 0, 0, x, x, x, 0]]
+                #         ^ start computing logits from here ([:, -(7-3+1):])
+                first_compute_index = loss_mask.nonzero(as_tuple=True)[1].min()
+                num_logits_to_keep = loss_mask.shape[1] - first_compute_index
+                model_kwargs["num_logits_to_keep"] = num_logits_to_keep.item() + 1  # +1 for the first label
+            '''
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, **model_kwargs)
+
+            # Offset the logits by one to align with the labels
+            logits = outputs.logits[:, :-1, :]
+            labels = input_ids[:, 1:].clone()
+            loss_mask = loss_mask[:, 1:].bool()
+            '''
+            if self.use_num_logits_to_keep:
+                # Align labels with logits
+                # logits:    -,  -, [x2, x3, x4, x5, x6]
+                #                     ^ --------- ^       after logits[:, :-1, :]
+                # labels:   [y0, y1, y2, y3, y4, y5, y6]
+                #                         ^ --------- ^   with num_logits_to_keep=4, [:, -4:]
+                # loss_mask: [0,  0,  0,  1,  1,  1,  1]
+                labels = labels[:, -num_logits_to_keep:]
+                loss_mask = loss_mask[:, -num_logits_to_keep:]
+            '''
+            all_logits = outputs.logits
 
         def cross_entropy_loss(logits, labels):
             if not self.is_encoder_decoder:
@@ -774,18 +1056,13 @@ class ORPOTrainer(Trainer):
             loss = loss_fct(logits, labels)
             return loss
 
-        if self.is_encoder_decoder:
-            labels = concatenated_batch["concatenated_labels"].clone()
-        else:
-            labels = concatenated_batch["concatenated_input_ids"].clone()
-            attention_mask = concatenated_batch["concatenated_attention_mask"]
-            labels = torch.where(attention_mask == 1, labels, self.label_pad_token_id)
-
+        print(all_logits)
+        print(labels)
         chosen_nll_loss = cross_entropy_loss(all_logits[:len_chosen], labels[:len_chosen])
 
         all_logps = self.get_batch_logps(
             all_logits,
-            concatenated_batch["concatenated_labels"],
+            labels,
             average_log_prob=True,
             is_encoder_decoder=self.is_encoder_decoder,
             label_pad_token_id=self.label_pad_token_id,
@@ -794,8 +1071,12 @@ class ORPOTrainer(Trainer):
         chosen_logps = all_logps[:len_chosen]
         rejected_logps = all_logps[len_chosen:]
 
-        chosen_logits = all_logits[:len_chosen]
-        rejected_logits = all_logits[len_chosen:]
+        if not self.is_encoder_decoder:
+            chosen_logits = all_logits[:len_chosen, :-1, :]
+            rejected_logits = all_logits[len_chosen:, :-1, :]
+        else:
+            chosen_logits = all_logits[:len_chosen]
+            rejected_logits = all_logits[len_chosen:]
 
         if self.aux_loss_enabled:
             return (chosen_logps, rejected_logps, chosen_logits, rejected_logits, chosen_nll_loss, outputs.aux_loss)
